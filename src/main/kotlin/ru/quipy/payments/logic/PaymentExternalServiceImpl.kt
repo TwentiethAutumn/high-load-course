@@ -2,16 +2,14 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.Dispatcher
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
@@ -54,39 +52,21 @@ class PaymentExternalServiceImpl(
     private fun getAccountProcessingInfo(paymentId: UUID, paymentStartedAt: Long): AccountProcessingInfo {
         for (accountProcessingInfo in accountProcessingInfos) {
             if (
-                (Duration
-                    .ofMillis(
-                        paymentOperationTimeout.toMillis() - (now() - paymentStartedAt)
-                    ) - accountProcessingInfo.request95thPercentileProcessingTime).toMillis() * accountProcessingInfo.speedPerMillisecond() >
-                accountProcessingInfo.queueLength.get()
-
+                Duration.ofMillis(now() - paymentStartedAt) <=
+                Duration.ofMillis(paymentOperationTimeout.toMillis() - accountProcessingInfo.request95thPercentileProcessingTime.toMillis() * 2)
             ) {
-                if (accountProcessingInfo.queueLength.get() == 0) {
-                    val windowResult = accountProcessingInfo.requestCounter.putIntoWindow()
-                    if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
-                        while (!accountProcessingInfo.rateLimiter.tick()) {
-                            logger.warn("[${accountProcessingInfo.accountName}] Payment $paymentId waiting for tick. Already passed: ${now() - paymentStartedAt} ms")
-                            continue
-                        }
-                        return accountProcessingInfo
-                    }
-                }
-                val number = accountProcessingInfo.queueLength.getAndIncrement()
-                logger.warn("[${accountProcessingInfo.accountName}] Added payment $paymentId in queue. Current number $number. Already passed: ${now() - paymentStartedAt} ms")
-            } else {
-                continue
-            }
-            do {
                 val windowResult = accountProcessingInfo.requestCounter.putIntoWindow()
                 if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
-                    accountProcessingInfo.queueLength.decrementAndGet()
                     while (!accountProcessingInfo.rateLimiter.tick()) {
                         logger.warn("[${accountProcessingInfo.accountName}] Payment $paymentId waiting for tick. Already passed: ${now() - paymentStartedAt} ms")
                         continue
                     }
                     return accountProcessingInfo
                 }
-            } while (true)
+                logger.warn("[${accountProcessingInfo.accountName}] Added payment $paymentId in queue. Already passed: ${now() - paymentStartedAt} ms")
+            } else {
+                continue
+            }
         }
         return accountProcessingInfos.last()
     }
@@ -119,41 +99,47 @@ class PaymentExternalServiceImpl(
         }.build()
 
         try {
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[${accountProcessingInfo.accountName}] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(false, e.message)
-                }
-
-                logger.warn("[${accountProcessingInfo.accountName}] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-            }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+            client.newCall(request).enqueue(object : Callback {
+                override fun onResponse(call: Call, response: Response) {
+                    val body = try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[${accountProcessingInfo.accountName}] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        ExternalSysResponse(false, e.message)
                     }
-                }
 
-                else -> {
-                    logger.error(
-                        "[${accountProcessingInfo.accountName}] Payment failed for txId: $transactionId, payment: $paymentId",
-                        e
-                    )
+                    logger.warn("[${accountProcessingInfo.accountName}] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
+                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
+
                 }
-            }
+
+                override fun onFailure(call: Call, e: IOException) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+
+                        else -> {
+                            logger.error(
+                                "[${accountProcessingInfo.accountName}] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
+                        }
+                    }
+
+                }
+            })
         } finally {
             accountProcessingInfo.requestCounter.releaseWindow()
         }
@@ -172,7 +158,6 @@ class AccountProcessingInfo(
     val request95thPercentileProcessingTime = properties.request95thPercentileProcessingTime
     val requestCounter = NonBlockingOngoingWindow(maxParallelRequests)
     val rateLimiter = RateLimiter(rateLimitPerSec)
-    val queueLength = AtomicInteger(0)
 
     fun speedPerMillisecond(): Double =
         min(
