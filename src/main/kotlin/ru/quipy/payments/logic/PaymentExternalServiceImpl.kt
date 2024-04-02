@@ -2,13 +2,11 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.Dispatcher
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -17,6 +15,7 @@ import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.min
 
 
 // Advice: always treat time as a Duration
@@ -43,33 +42,38 @@ class PaymentExternalServiceImpl(
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
-    private val httpClientExecutor = Executors.newCachedThreadPool()
+    private val httpClientExecutor = Executors.newSingleThreadExecutor()
 
     private val client = OkHttpClient.Builder().run {
         dispatcher(Dispatcher(httpClientExecutor))
         build()
     }
 
-    private fun getAccountProcessingInfo(paymentStartedAt: Long): AccountProcessingInfo {
-        while (true) {
-            for (accountProcessingInfo in accountProcessingInfos) {
-                val waitStartTime = now()
-                while (Duration.ofMillis(now() - waitStartTime) <= waitDuration) {
-                    val curRequestCount = accountProcessingInfo.requestCounter.get()
-                    if (curRequestCount < accountProcessingInfo.parallelRequests &&
-                        Duration.ofMillis(now() - paymentStartedAt) <=
-                        Duration.ofMillis(paymentOperationTimeout.toMillis() - accountProcessingInfo.request95thPercentileProcessingTime.toMillis() * 2)) {
-                        if (accountProcessingInfo.requestCounter.compareAndSet(curRequestCount, curRequestCount + 1)) {
-                            return accountProcessingInfo
-                        }
+    private fun getAccountProcessingInfo(paymentId: UUID, paymentStartedAt: Long): AccountProcessingInfo {
+        for (accountProcessingInfo in accountProcessingInfos) {
+            if (
+                Duration.ofMillis(now() - paymentStartedAt) <=
+                Duration.ofMillis(paymentOperationTimeout.toMillis() - accountProcessingInfo.request95thPercentileProcessingTime.toMillis() * 2)
+            ) {
+                val windowResult = accountProcessingInfo.requestCounter.putIntoWindow()
+                if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                    while (!accountProcessingInfo.rateLimiter.tick()) {
+                        logger.warn("[${accountProcessingInfo.accountName}] Payment $paymentId waiting for tick. Already passed: ${now() - paymentStartedAt} ms")
+                        continue
                     }
+                    return accountProcessingInfo
                 }
+                logger.warn("[${accountProcessingInfo.accountName}] Added payment $paymentId in queue. Already passed: ${now() - paymentStartedAt} ms")
+            } else {
+                continue
             }
         }
+        return accountProcessingInfos.last()
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        val accountProcessingInfo = getAccountProcessingInfo(paymentStartedAt)
+        logger.warn("Payment $paymentId started choosing account. Already passed: ${now() - paymentStartedAt} ms")
+        val accountProcessingInfo = getAccountProcessingInfo(paymentId, paymentStartedAt)
         logger.warn("[${accountProcessingInfo.accountName}] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
         val transactionId = UUID.randomUUID()
@@ -81,9 +85,8 @@ class PaymentExternalServiceImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        if (Duration.ofMillis(now() - paymentStartedAt) > paymentOperationTimeout
-            || accountProcessingInfo.requestCounter.get() > accountProcessingInfo.parallelRequests) {
-            accountProcessingInfo.requestCounter.decrementAndGet()
+        if (Duration.ofMillis(now() - paymentStartedAt) > paymentOperationTimeout) {
+            accountProcessingInfo.requestCounter.releaseWindow()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
             }
@@ -95,63 +98,72 @@ class PaymentExternalServiceImpl(
             post(emptyBody)
         }.build()
 
-        client.newCall(request).enqueue(object : Callback {
-            override fun onResponse(call: Call, response: Response) {
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[${accountProcessingInfo.accountName}] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(false, e.message)
+        try {
+            client.newCall(request).enqueue(object : Callback {
+                override fun onResponse(call: Call, response: Response) {
+                    val body = try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[${accountProcessingInfo.accountName}] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        ExternalSysResponse(false, e.message)
+                    }
+
+                    logger.warn("[${accountProcessingInfo.accountName}] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
+
                 }
 
-                logger.warn("[${accountProcessingInfo.accountName}] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                override fun onFailure(call: Call, e: IOException) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
+                        else -> {
+                            logger.error(
+                                "[${accountProcessingInfo.accountName}] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
 
-                accountProcessingInfo.requestCounter.decrementAndGet()
-            }
-
-            override fun onFailure(call: Call, e: IOException) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
                         }
                     }
 
-                    else -> {
-                        logger.error(
-                            "[${accountProcessingInfo.accountName}] Payment failed for txId: $transactionId, payment: $paymentId",
-                            e
-                        )
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                    }
                 }
-
-                accountProcessingInfo.requestCounter.decrementAndGet()
-            }
-        })
+            })
+        } finally {
+            accountProcessingInfo.requestCounter.releaseWindow()
+        }
     }
 }
 
 fun ExternalServiceProperties.toAccountProcessingInfo(): AccountProcessingInfo = AccountProcessingInfo(this)
 
-data class AccountProcessingInfo(
-    private val properties: ExternalServiceProperties
+class AccountProcessingInfo(
+    properties: ExternalServiceProperties
 ) {
     val serviceName = properties.serviceName
     val accountName = properties.accountName
-    val parallelRequests = properties.parallelRequests
+    val maxParallelRequests = properties.parallelRequests
     val rateLimitPerSec = properties.rateLimitPerSec
     val request95thPercentileProcessingTime = properties.request95thPercentileProcessingTime
-    val requestCounter = AtomicInteger(0)
+    val requestCounter = NonBlockingOngoingWindow(maxParallelRequests)
+    val rateLimiter = RateLimiter(rateLimitPerSec)
+
+    fun speedPerMillisecond(): Double =
+        min(
+            maxParallelRequests.toDouble() / (request95thPercentileProcessingTime.toMillis()),
+            rateLimitPerSec.toDouble() / 1000
+        )
 }
 
 public fun now() = System.currentTimeMillis()
